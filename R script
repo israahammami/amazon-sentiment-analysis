@@ -1,1 +1,98 @@
+# ==============================================================================
+# PROJECT: Sentiment Analysis Pipeline for Amazon Reviews
+# AUTHORS: Aya YAHIA & Israa HAMMAMI
+# DESCRIPTION: End-to-end NLP pipeline: from cleaning and lexicon-based labeling 
+#              to benchmarking five supervised machine learning classifiers.
+# ==============================================================================
 
+# 1. Environment Setup ---------------------------------------------------------
+library(tidyverse)
+library(tidytext)
+library(tm)
+library(caret)
+library(e1071)
+library(pROC)
+library(wordcloud)
+library(RColorBrewer)
+library(janitor)
+library(ranger)
+library(rpart)
+
+# 2. Data Ingestion & Pre-processing ------------------------------------------
+raw_data <- read_csv("Amazon_Reviews.csv") %>% clean_names()
+
+reviews <- raw_data %>%
+  mutate(
+    review_text = paste(review_title, review_text),
+    review_text = tolower(review_text),
+    review_text = str_replace_all(review_text, "http\\S+|www\\.\\S+|[^a-z\\s]|\\s+", " "),
+    review_text = str_trim(review_text)
+  ) %>%
+  filter(!is.na(review_text), nchar(review_text) > 20) %>%
+  distinct(review_text, .keep_all = TRUE)
+
+# 3. Ground Truth Generation (Lexicon-based) -----------------------------------
+bing_lex <- get_sentiments("bing")
+
+# Calculate sentiment scores per review
+sent_scores <- reviews %>%
+  mutate(id = row_number()) %>%
+  unnest_tokens(word, review_text) %>%
+  inner_join(bing_lex, by = "word") %>%
+  count(id, sentiment) %>%
+  pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>%
+  mutate(score = positive - negative)
+
+reviews_labeled <- reviews %>%
+  mutate(id = row_number()) %>%
+  left_join(sent_scores, by = "id") %>%
+  mutate(label = factor(ifelse(coalesce(score, 0) >= 0, "positive", "negative")))
+
+# 4. Balancing & Feature Engineering -------------------------------------------
+min_n <- min(table(reviews_labeled$label))
+balanced_data <- reviews_labeled %>%
+  group_by(label) %>%
+  sample_n(min_n) %>%
+  ungroup() %>%
+  sample_frac(1)
+
+# Construct Document-Term Matrix (DTM)
+corpus <- VCorpus(VectorSource(balanced_data$review_text)) %>%
+  tm_map(content_transformer(tolower)) %>%
+  tm_map(removePunctuation) %>%
+  tm_map(removeNumbers) %>%
+  tm_map(removeWords, stopwords("en")) %>%
+  tm_map(stripWhitespace)
+
+dtm <- DocumentTermMatrix(corpus, control = list(wordLengths = c(3, Inf))) %>%
+  removeSparseTerms(0.995)
+
+# 5. Model Training & Evaluation -----------------------------------------------
+set.seed(42)
+split <- createDataPartition(balanced_data$label, p = 0.8, list = FALSE)
+train_mat <- as.matrix(dtm[split, ])
+test_mat  <- as.matrix(dtm[-split, ])
+train_lab <- balanced_data$label[split]
+test_lab  <- balanced_data$label[-split]
+
+# Example: Random Forest implementation
+rf_model <- ranger(
+  data = data.frame(label = train_lab, train_mat),
+  dependent.variable.name = "label",
+  num.trees = 300, 
+  probability = TRUE
+)
+
+# 6. Performance Benchmarking --------------------------------------------------
+# [Refer to the full script logic for all 5 models: NB, LogReg, Tree, RF, KNN]
+# Helper function to generate standardized performance metrics:
+get_metrics <- function(actual, pred, prob) {
+  cm <- confusionMatrix(pred, actual, positive = "positive")
+  roc_obj <- roc(actual, prob, levels = c("negative", "positive"), quiet = TRUE)
+  data.frame(
+    Accuracy = cm$overall["Accuracy"],
+    Precision = cm$byClass["Precision"],
+    F1 = cm$byClass["F1"],
+    AUC = auc(roc_obj)
+  )
+}
